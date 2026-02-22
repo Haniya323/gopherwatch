@@ -2,47 +2,36 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
 	"net"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+	"time"
 
+	"gopherwatch/alerting"
+	"gopherwatch/api"
+	pb "gopherwatch/proto"
+
+	_ "github.com/go-sql-driver/mysql"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
-	pb "gopherwatch/proto"
 )
 
-// ============================================
-// STATE MANAGEMENT
-// sync.Map = thread safe map, multiple goroutines
-// can read/write safely at the same time
-// ============================================
-
 var serviceState sync.Map
-
-// This stores the latest metric for each service
-type ServiceHealth struct {
-	ServiceID    string
-	CPU          float64
-	Memory       float64
-	RequestCount int64
-	Status       string
-}
-
-// ============================================
-// gRPC SERVER
-// ============================================
+var db *sql.DB
 
 type metricsServer struct {
 	pb.UnimplementedMetricsServiceServer
+	alertEngine *alerting.AlertEngine
 }
 
-// This runs every time an agent connects and starts streaming
 func (s *metricsServer) SendMetrics(stream pb.MetricsService_SendMetricsServer) error {
-	// Read Service-ID from metadata (sent by the agent)
-	// Metadata is like HTTP headers — extra info sent with the request
 	md, ok := metadata.FromIncomingContext(stream.Context())
 	serviceID := "unknown"
 	if ok {
@@ -53,56 +42,45 @@ func (s *metricsServer) SendMetrics(stream pb.MetricsService_SendMetricsServer) 
 	}
 
 	slog.Info("Agent connected", "service_id", serviceID)
-
 	totalReceived := 0
 
-	// Keep receiving metrics until agent disconnects
 	for {
-		// Wait for next metric from agent
 		report, err := stream.Recv()
 
-		// io.EOF means agent finished streaming — normal ending
 		if err == io.EOF {
-			slog.Info("Agent finished streaming", "service_id", serviceID, "total", totalReceived)
-
-			// Send summary back to agent
+			slog.Info("Agent finished streaming",
+				"service_id", serviceID,
+				"total", totalReceived,
+			)
 			return stream.SendAndClose(&pb.Summary{
 				Message:       fmt.Sprintf("Received %d metrics from %s", totalReceived, serviceID),
 				TotalReceived: int32(totalReceived),
 			})
 		}
 
-		// Any other error means something went wrong
 		if err != nil {
 			slog.Error("Stream error", "service_id", serviceID, "error", err)
 			return err
 		}
 
 		totalReceived++
-
-		// Update the service state with latest metrics
-		serviceState.Store(serviceID, ServiceHealth{
+		serviceState.Store(serviceID, api.ServiceStatus{
 			ServiceID:    serviceID,
 			CPU:          report.Cpu,
 			Memory:       report.Memory,
 			RequestCount: report.RequestCount,
+			LastSeen:     time.Now(),
 			Status:       "healthy",
 		})
+		s.alertEngine.Dispatch(report)
 
 		slog.Info("Metric received",
 			"service_id", serviceID,
 			"cpu", report.Cpu,
 			"memory", report.Memory,
-			"requests", report.RequestCount,
 		)
 	}
 }
-
-// ============================================
-// INTERCEPTOR (MIDDLEWARE)
-// Runs before every gRPC call — like a security
-// guard that checks everyone coming in
-// ============================================
 
 func loggingInterceptor(
 	ctx context.Context,
@@ -110,7 +88,6 @@ func loggingInterceptor(
 	info *grpc.UnaryServerInfo,
 	handler grpc.UnaryHandler,
 ) (interface{}, error) {
-	// Extract service-id from metadata
 	md, ok := metadata.FromIncomingContext(ctx)
 	serviceID := "unknown"
 	if ok {
@@ -119,17 +96,10 @@ func loggingInterceptor(
 			serviceID = ids[0]
 		}
 	}
-
-	slog.Info("Interceptor caught request",
-		"method", info.FullMethod,
-		"service_id", serviceID,
-	)
-
-	// Pass the request through to the actual handler
+	slog.Info("Interceptor", "method", info.FullMethod, "service_id", serviceID)
 	return handler(ctx, req)
 }
 
-// Stream interceptor — same but for streaming calls
 func streamInterceptor(
 	srv interface{},
 	ss grpc.ServerStream,
@@ -144,40 +114,73 @@ func streamInterceptor(
 			serviceID = ids[0]
 		}
 	}
-
-	slog.Info("Stream interceptor",
-		"method", info.FullMethod,
-		"service_id", serviceID,
-	)
-
+	slog.Info("Stream interceptor", "method", info.FullMethod, "service_id", serviceID)
 	return handler(srv, ss)
 }
 
-// ============================================
-// MAIN
-// ============================================
-
 func main() {
-	slog.Info("Starting GopherWatch gRPC Server...")
+	slog.Info("Starting GopherWatch...")
 
-	// Listen on port 50051
+	// Connect to database
+	var err error
+	db, err = sql.Open("mysql",
+		"root:Infoblox@12345@tcp(127.0.0.1:3306)/monitoring_system?parseTime=true")
+	if err != nil {
+		log.Fatal("DB connection failed:", err)
+	}
+	if err = db.Ping(); err != nil {
+		log.Fatal("DB not responding:", err)
+	}
+	slog.Info("Connected to MySQL!")
+	defer db.Close()
+
+	// Start alert engine
+	alertEngine := alerting.NewAlertEngine(&serviceState, db)
+	alertEngine.StartWorkerPool(5)
+
+	// Start REST API in background
+	apiServer := api.NewAPIServer(db, &serviceState)
+	go apiServer.Start()
+
+	// Start gRPC server
 	listener, err := net.Listen("tcp", ":50051")
 	if err != nil {
 		log.Fatal("Failed to listen:", err)
 	}
 
-	// Create gRPC server WITH interceptors attached
 	grpcServer := grpc.NewServer(
-		grpc.UnaryInterceptor(loggingInterceptor), // for regular calls
-		grpc.StreamInterceptor(streamInterceptor), // for streaming calls
+		grpc.UnaryInterceptor(loggingInterceptor),
+		grpc.StreamInterceptor(streamInterceptor),
 	)
 
-	// Register our metrics service
-	pb.RegisterMetricsServiceServer(grpcServer, &metricsServer{})
+	pb.RegisterMetricsServiceServer(grpcServer, &metricsServer{
+		alertEngine: alertEngine,
+	})
 
-	slog.Info("gRPC Server listening", "port", 50051)
+	// Start gRPC in background
+	go func() {
+		slog.Info("gRPC Server listening", "port", 50051)
+		if err := grpcServer.Serve(listener); err != nil {
+			slog.Error("gRPC error", "error", err)
+		}
+	}()
 
-	if err := grpcServer.Serve(listener); err != nil {
-		log.Fatal("Failed to serve:", err)
-	}
+	// ============================================
+	// GRACEFUL SHUTDOWN
+	// Wait for Ctrl+C then cleanly stop everything
+	// ============================================
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// Block here until Ctrl+C is pressed
+	<-quit
+
+	slog.Info("Shutdown signal received...")
+
+	// Stop everything in order
+	grpcServer.GracefulStop() // finish active streams then stop
+	alertEngine.Stop()        // finish processing alerts then stop
+	apiServer.Stop()          // finish active requests then stop
+
+	slog.Info("GopherWatch stopped cleanly. Goodbye!")
 }
