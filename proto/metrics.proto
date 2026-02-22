@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package metrics;
+
+option go_package = "./proto";
+
+// This is what one metric report looks like
+// The agent (client) sends these to the server
+message MetricReport {
+    string service_id   = 1;  // which agent is this? e.g. "web-server-01"
+    double cpu          = 2;  // CPU usage percentage e.g. 87.5
+    double memory       = 3;  // Memory usage percentage e.g. 72.1
+    int64  request_count = 4; // how many requests handled
+    int64  timestamp    = 5;  // when was this recorded
+}
+
+// This is what the server sends back when streaming is done
+message Summary {
+    string message      = 1;  // e.g. "Received 100 metrics from web-server-01"
+    int32  total_received = 2; // how many metrics were received
+}
+
+// The service definition
+service MetricsService {
+    // Client streams many MetricReports TO server
+    // Server responds with ONE Summary at the end
+    rpc SendMetrics(stream MetricReport) returns (Summary);
+}
